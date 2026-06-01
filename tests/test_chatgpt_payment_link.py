@@ -135,6 +135,30 @@ def test_fetch_us_billing_address_can_keep_remote_card_when_disabled(monkeypatch
     assert address["card_cvv"] == "327"
 
 
+def test_fetch_billing_address_falls_back_to_local_jp_seed_on_remote_tls_error(monkeypatch):
+    calls = {"post": 0}
+
+    def fake_post(url, **kwargs):
+        calls["post"] += 1
+        raise RuntimeError(
+            "Failed to perform, curl: (35) TLS connect error: "
+            "OPENSSL_internal:invalid library"
+        )
+
+    monkeypatch.setattr(payment_module.cffi_requests, "post", fake_post)
+    monkeypatch.setattr(payment_module.time, "sleep", lambda seconds: None)
+
+    address = payment_module.fetch_billing_address("JP", use_local_card=False)
+
+    assert calls["post"] == 3
+    assert address["country"] == "JP"
+    assert address["name"] == "James Smith"
+    assert address["line1"] == "Marunouchi 1-1"
+    assert address["city"] == "Chiyoda-ku"
+    assert address["state"] == "Tokyo"
+    assert address["postal_code"] == "100-0005"
+
+
 def test_fetch_ctf_relay_code_extracts_six_digit_code(monkeypatch):
     def fake_get(url, **kwargs):
         assert url == payment_module.CTF_RELAY_CODE_URL
@@ -3995,6 +4019,74 @@ def test_complete_paypal_checkout_uses_camoufox_and_submits(monkeypatch):
     )
     assert terms_index < submit_index
     assert any(event[0] == "click" and "submit" in event[1].lower() for event in page.events)
+
+
+def test_complete_paypal_checkout_retries_initial_checkout_navigation(monkeypatch):
+    state = {"logs": []}
+
+    class FakePage:
+        def __init__(self):
+            self.context = SimpleNamespace(add_cookies=lambda cookies: None)
+            self.url = "about:blank"
+            self.goto_calls = 0
+
+        def goto(self, url, **kwargs):
+            self.goto_calls += 1
+            if self.goto_calls < 3:
+                raise RuntimeError(
+                    f"Page.goto: net::ERR_CONNECTION_CLOSED at {url}"
+                )
+            self.url = url
+
+        def wait_for_timeout(self, timeout):
+            pass
+
+    class FakeContext:
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    page = FakePage()
+
+    monkeypatch.setattr(
+        payment_module,
+        "_open_unique_camoufox_page",
+        lambda *args, **kwargs: (FakeContext(), object(), page),
+    )
+    monkeypatch.setattr(
+        payment_module,
+        "fetch_us_billing_address",
+        lambda *, email="": {
+            "name": "Gul Bai",
+            "line1": "2798 Clover Drive",
+            "city": "Colorado Springs",
+            "state": "CO",
+            "postal_code": "80911",
+            "phone": "719-464-8566",
+            "country": "US",
+            "email": email,
+        },
+    )
+    monkeypatch.setattr(payment_module, "_probe_camoufox_proxy_exit", lambda page, *, log: {"ok": True})
+    monkeypatch.setattr(payment_module, "_wait_checkout_page_ready", lambda page, *, timeout_ms, log: None)
+    monkeypatch.setattr(payment_module, "_verify_checkout_is_free_trial", lambda page, *, log: None)
+    monkeypatch.setattr(
+        payment_module,
+        "detect_paypal_stage",
+        lambda page: {"stage": payment_module._STAGE_CHATGPT_SUCCESS},
+    )
+    monkeypatch.setattr(payment_module.time, "sleep", lambda seconds: None)
+
+    result = payment_module.complete_paypal_checkout(
+        checkout_url="https://pay.openai.com/c/pay/cs_test_plus",
+        headless=True,
+        hold_seconds=0,
+        log_fn=state["logs"].append,
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "completed"
+    assert page.goto_calls == 3
+    assert any("打开 ChatGPT 测试支付链接瞬时网络失败" in message for message in state["logs"])
 
 
 def test_complete_paypal_checkout_reopens_camoufox_for_duplicate_fingerprint(monkeypatch):
@@ -7891,10 +7983,82 @@ def test_ctf_card_field_ready_detects_card_number_input():
     assert payment_module._ctf_card_field_ready(FakePage()) is True
 
 
+def test_wait_and_type_dob_uses_formatted_text_when_digit_mask_misgroups():
+    state = {"value": "", "typed": []}
+
+    class FakeKeyboard:
+        def press(self, key):
+            if key == "Delete":
+                state["value"] = ""
+
+        def type(self, text, delay=0):
+            state["typed"].append(text)
+            if text == "06151990":
+                state["value"] = "0615/1/9"
+            elif text == "06/15/1990":
+                state["value"] = "06/15/1990"
+
+    class FakeLocator:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        def click(self):
+            pass
+
+    class FakePage:
+        keyboard = FakeKeyboard()
+
+        def evaluate(self, script, arg=None):
+            if "document.getElementById" in script:
+                return state["value"]
+            return None
+
+        def locator(self, selector):
+            return FakeLocator()
+
+        def wait_for_timeout(self, timeout):
+            pass
+
+    assert payment_module._wait_and_type_dob_by_id(
+        FakePage(),
+        "dateOfBirth",
+        "06/15/1990",
+        attempts=1,
+        interval_ms=0,
+        log=lambda _m: None,
+    ) is True
+    assert state["typed"] == ["06/15/1990"]
+    assert state["value"] == "06/15/1990"
+
+
 def test_fill_ctf_payment_form_fills_both_kanji_and_kana_names_for_jp():
     """JP 区统一 guest 表单：漢字组(#firstName/#lastName) 和片假名组
     (#countrySpecificFirstName/#countrySpecificLastName) 都要分别填对。"""
     fills = {}
+    values = {}
+    id_to_key = {
+        "firstName": "kanji_first",
+        "lastName": "kanji_last",
+        "countrySpecificFirstName": "kana_first",
+        "countrySpecificLastName": "kana_last",
+        "dateOfBirth": "dob",
+        "cardNumber": "card",
+        "email": "email",
+        "password": "password",
+        "phone": "phone",
+        "cardCvv": "cvv",
+        "cardExpiry": "exp",
+        "billingPostalCode": "zip",
+        "billingState": "state",
+        "billingCity": "city",
+        "billingLine1": "line1",
+        "billingLine2": "line2",
+    }
+
+    def key_for_id(element_id):
+        return id_to_key.get(str(element_id or ""), str(element_id or ""))
 
     class FakeLocator:
         def __init__(self, key, ready=True):
@@ -7912,23 +8076,64 @@ def test_fill_ctf_payment_form_fills_both_kanji_and_kana_names_for_jp():
             return self.ready
 
         def input_value(self, timeout=0):
-            return ""
+            return values.get(self.key, "")
 
         def fill(self, value, **kwargs):
             fills[self.key] = value
+            values[self.key] = value
 
         def select_option(self, **kwargs):
-            fills[self.key] = kwargs.get("value") or kwargs.get("label")
+            value = kwargs.get("value") or kwargs.get("label")
+            fills[self.key] = value
+            values[self.key] = value
 
         def evaluate(self, *a, **k):
-            return ""
+            return values.get(self.key, "")
+
+        def click(self):
+            pass
+
+        def type(self, value, **kwargs):
+            fills[self.key] = value
+            values[self.key] = value
+
+    class FakeKeyboard:
+        def __init__(self):
+            self.active_key = None
+
+        def press(self, key):
+            if key == "Delete" and self.active_key:
+                fills[self.active_key] = ""
+                values[self.active_key] = ""
+
+        def type(self, value, **kwargs):
+            if self.active_key:
+                fills[self.active_key] = value
+                values[self.active_key] = value
 
     class FakePage:
+        def __init__(self):
+            self.keyboard = FakeKeyboard()
+
         def wait_for_timeout(self, timeout):
             pass
 
         def keyboard_press(self, *a, **k):
             pass
+
+        def evaluate(self, script, arg=None):
+            if isinstance(arg, dict) and "id" in arg and "value" in arg:
+                key = key_for_id(arg["id"])
+                value = str(arg.get("value") or "")
+                fills[key] = value
+                values[key] = value
+                return f"ok:{value}"
+            if isinstance(arg, str):
+                key = key_for_id(arg)
+                if key in values:
+                    return values.get(key, "")
+                return "" if key in id_to_key.values() else "__noel__"
+            return None
 
         def locator(self, selector):
             s = selector
@@ -7943,6 +8148,7 @@ def test_fill_ctf_payment_form_fills_both_kanji_and_kana_names_for_jp():
             if "countryspecificlast" in sl:
                 return FakeLocator("kana_last")
             if "dateofbirth" in sl:
+                self.keyboard.active_key = "dob"
                 return FakeLocator("dob")
             if "cardnumber" in sl or "cc-number" in sl:
                 return FakeLocator("card")
@@ -8013,7 +8219,7 @@ def test_fill_ctf_payment_form_fills_both_kanji_and_kana_names_for_jp():
     assert fills.get("kanji_last") == "清水"
     assert fills.get("kana_first") == "アイリ"
     assert fills.get("kana_last") == "シミズ"
-    assert fills.get("dob") == "1993/11/08"
+    assert fills.get("dob") == "11/08/1993"
 
 
 def test_fill_checkout_field_selects_hidden_native_select_via_js():

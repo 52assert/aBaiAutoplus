@@ -298,9 +298,137 @@ def fetch_us_billing_address(*, email: str = "", use_local_card: bool = True) ->
 # JP 路径用户实测可用：``{"path": "/jp-address", "method": "address"}``。
 # 接口的字段名跟 US 完全对齐，所以下层 normalize 共用一份。
 _BILLING_ADDRESS_REGION_PATHS = {
+    "AU": "/au-address",
+    "DE": "/de-address",
+    "FR": "/fr-address",
+    "ID": "/id-address",
     "US": "/",
     "JP": "/jp-address",
+    "KR": "/kr-address",
 }
+
+# Address seed values adapted from FoundZiGu/GuJumpgate data/address-sources.js
+# (MIT License, copyright 2026 whwh1233 / QLHazyCoder and contributors).
+_LOCAL_BILLING_ADDRESS_SEEDS = {
+    "AU": (
+        {
+            "line1": "Thyne Reid Drive",
+            "city": "Thredbo",
+            "state": "New South Wales",
+            "postal_code": "2625",
+        },
+        {
+            "line1": "George Street",
+            "city": "Sydney",
+            "state": "New South Wales",
+            "postal_code": "2000",
+        },
+    ),
+    "DE": (
+        {
+            "line1": "Unter den Linden",
+            "city": "Berlin",
+            "state": "Berlin",
+            "postal_code": "10117",
+        },
+        {
+            "line1": "Marienplatz",
+            "city": "Munich",
+            "state": "Bavaria",
+            "postal_code": "80331",
+        },
+    ),
+    "FR": (
+        {
+            "line1": "Rue de Rivoli",
+            "city": "Paris",
+            "state": "Ile-de-France",
+            "postal_code": "75001",
+        },
+        {
+            "line1": "Rue de la Republique",
+            "city": "Lyon",
+            "state": "Auvergne-Rhone-Alpes",
+            "postal_code": "69002",
+        },
+    ),
+    "ID": (
+        {
+            "line1": "Jalan M.H. Thamrin No. 1",
+            "city": "Jakarta",
+            "state": "DKI Jakarta",
+            "postal_code": "10310",
+        },
+        {
+            "line1": "Jalan Jenderal Sudirman Kav. 52-53",
+            "city": "Jakarta",
+            "state": "DKI Jakarta",
+            "postal_code": "12190",
+        },
+    ),
+    "JP": (
+        {
+            "line1": "Marunouchi 1-1",
+            "city": "Chiyoda-ku",
+            "state": "Tokyo",
+            "postal_code": "100-0005",
+        },
+        {
+            "line1": "Umeda 3-1",
+            "city": "Kita-ku",
+            "state": "Osaka",
+            "postal_code": "530-0001",
+        },
+    ),
+    "KR": (
+        {
+            "line1": "Sejong-daero 110",
+            "city": "Jung-gu",
+            "state": "Seoul",
+            "postal_code": "04524",
+        },
+        {
+            "line1": "Teheran-ro 152",
+            "city": "Gangnam-gu",
+            "state": "Seoul",
+            "postal_code": "06236",
+        },
+    ),
+    "US": (
+        {
+            "line1": "Broadway",
+            "city": "New York",
+            "state": "New York",
+            "postal_code": "10007",
+        },
+    ),
+}
+
+
+def _build_local_billing_address_fallback(
+    region_key: str,
+    *,
+    email: str = "",
+    use_local_card: bool = True,
+) -> dict:
+    normalized_region = str(region_key or "").strip().upper()
+    if normalized_region not in _LOCAL_BILLING_ADDRESS_SEEDS:
+        normalized_region = "US"
+    seed = _LOCAL_BILLING_ADDRESS_SEEDS[normalized_region][0]
+    address = {
+        "name": "James Smith",
+        "line1": seed["line1"],
+        "city": seed["city"],
+        "state": seed["state"],
+        "postal_code": seed["postal_code"],
+        "phone": "",
+        "country": normalized_region,
+        "email": str(email or "").strip(),
+        "source": "local_address_seed",
+    }
+    if use_local_card:
+        address.update(generate_visa_card())
+    return address
 
 
 def fetch_billing_address(
@@ -311,12 +439,11 @@ def fetch_billing_address(
 ) -> dict:
     """根据地区从 ``meiguodizhi.com`` 拉账单地址。
 
-    支持 ``region="US"`` / ``"JP"``（大小写不敏感）。地区不在白名单时回退
-    到 US，避免上层调用方传错值导致整个 checkout 流程崩。``use_local_card``
-    与 :func:`fetch_us_billing_address` 一致：JP 模式下默认仍然用本地
-    Luhn-valid Visa 替换远端卡，因为 PayPal hosted checkout 对远端测试卡
-    号风控偏严，本地生成的 Luhn 卡过卡号格式校验更稳定（实际扣款由
-    sandbox 模拟）。
+    支持 ``region="US"`` / ``"JP"`` 等地址种子表里的国家码（大小写不敏感）。
+    地区不在白名单时回退到 US，避免上层调用方传错值导致整个 checkout 流程崩。
+    ``use_local_card`` 与 :func:`fetch_us_billing_address` 一致：默认仍然用本地
+    Luhn-valid Visa 替换远端卡，因为 PayPal hosted checkout 对远端测试卡号
+    风控偏严，本地生成的 Luhn 卡过卡号格式校验更稳定（实际扣款由 sandbox 模拟）。
     """
     region_key = str(region or "").strip().upper()
     if region_key not in _BILLING_ADDRESS_REGION_PATHS:
@@ -325,7 +452,6 @@ def fetch_billing_address(
     # 与 generate_plus_link 同理：并发场景下 curl_cffi 首次多线程初始化 SSL
     # 库会偶发 ``curl: (35) ... invalid library`` 竞态。加轻量重试兜底，只对
     # 瞬时 TLS/连接错误重试。
-    last_exc: Exception | None = None
     resp = None
     for attempt in range(1, 4):
         try:
@@ -337,7 +463,6 @@ def fetch_billing_address(
             resp.raise_for_status()
             break
         except Exception as exc:  # noqa: BLE001 - 需按错误内容判断是否重试
-            last_exc = exc
             msg = str(exc).lower()
             transient = (
                 "tls connect error" in msg
@@ -348,12 +473,18 @@ def fetch_billing_address(
                 or "failed to perform" in msg
             )
             if attempt >= 3 or not transient:
-                raise
+                return _build_local_billing_address_fallback(
+                    region_key,
+                    email=email,
+                    use_local_card=use_local_card,
+                )
             time.sleep(0.5 * (2 ** (attempt - 1)))
     if resp is None:
-        if last_exc is not None:
-            raise last_exc
-        raise RuntimeError("账单地址接口无响应")
+        return _build_local_billing_address_fallback(
+            region_key,
+            email=email,
+            use_local_card=use_local_card,
+        )
     data = resp.json()
     address = _normalize_us_billing_address(
         data if isinstance(data, dict) else {},
@@ -363,8 +494,10 @@ def fetch_billing_address(
     required = ("name", "line1", "city", "state", "postal_code")
     missing = [key for key in required if not address.get(key)]
     if missing:
-        raise ValueError(
-            f"{region_key} 地址接口返回字段不完整: " + ", ".join(missing)
+        return _build_local_billing_address_fallback(
+            region_key,
+            email=email,
+            use_local_card=use_local_card,
         )
     if use_local_card:
         address.update(generate_visa_card())
@@ -4997,8 +5130,9 @@ def _wait_and_type_dob_by_id(
     里重新解析，常见结果是只保留前 6 字符（``10/09/1985`` → ``10/09/19``），
     导致 ``aria-invalid=true``。
 
-    可靠做法是模拟真实键入：focus → 全选清空 → 一位位敲数字。mask 库自己
-    会按模板插入 ``/``，最终拿到正确的 10 字符 ``MM/DD/YYYY``。
+    可靠做法是模拟真实键入：focus → 全选清空 → 输入 ``MM/DD/YYYY``。早先
+    版本输入纯数字并依赖 mask 自动插入 ``/``，但新版 PayPal 表单会把
+    ``06151990`` 重排成 ``0615/1/9``，所以这里明确键入带斜杠的文本。
     """
     eid = str(element_id or "").strip()
     if not eid:
@@ -5006,9 +5140,9 @@ def _wait_and_type_dob_by_id(
     val = str(value or "")
     if not val:
         return True
-    # 只保留数字（去掉可能传入的 ``/``）
-    digits = re.sub(r"\D", "", val)
-    if len(digits) != 8:
+    dob_value = _normalize_paypal_dob_value(val)
+    if not dob_value:
+        digits = re.sub(r"\D", "", val)
         if callable(log):
             log(f"  · #{eid} DOB 数字位数不为 8: {digits!r}（原值 {val!r}），回退到 JS 设值")
         return _wait_and_force_fill_by_id(page, eid, val, log=log, attempts=attempts, interval_ms=interval_ms)
@@ -5046,12 +5180,12 @@ def _wait_and_type_dob_by_id(
         except Exception:
             pass
         try:
-            # 用小延时让 mask 库每位都能挂上 ``/``
-            page.keyboard.type(digits, delay=40)
+            # 直接输入带斜杠的 MM/DD/YYYY，避免当前 PayPal mask 把纯数字重排坏。
+            page.keyboard.type(dob_value, delay=40)
         except Exception:
             try:
                 loc = page.locator(f"#{eid}").first
-                loc.type(digits, delay=40)
+                loc.type(dob_value, delay=40)
             except Exception:
                 pass
         try:
@@ -5075,6 +5209,41 @@ def _wait_and_type_dob_by_id(
     if callable(log):
         log(f"  · #{eid} 多次重试仍未填上 DOB")
     return False
+
+
+def _normalize_paypal_dob_value(value: str) -> str:
+    """把常见 DOB 输入规范成 PayPal hosted 接受的 ``MM/DD/YYYY``。"""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parts = re.findall(r"\d+", raw)
+    year = month = day = ""
+    if len(parts) >= 3:
+        first, second, third = parts[:3]
+        if len(first) == 4:
+            year, month, day = first, second, third
+        else:
+            month, day, year = first, second, third
+    else:
+        digits = re.sub(r"\D", "", raw)
+        if len(digits) != 8:
+            return ""
+        possible_year = int(digits[:4])
+        possible_month = int(digits[4:6])
+        possible_day = int(digits[6:8])
+        if 1900 <= possible_year <= 2099 and 1 <= possible_month <= 12 and 1 <= possible_day <= 31:
+            year, month, day = digits[:4], digits[4:6], digits[6:8]
+        else:
+            month, day, year = digits[:2], digits[2:4], digits[4:8]
+    try:
+        year_int = int(year)
+        month_int = int(month)
+        day_int = int(day)
+    except Exception:
+        return ""
+    if not (1900 <= year_int <= 2099 and 1 <= month_int <= 12 and 1 <= day_int <= 31):
+        return ""
+    return f"{month_int:02d}/{day_int:02d}/{year_int:04d}"
 
 
 def _wait_and_force_fill_by_id(
@@ -5268,7 +5437,7 @@ def _fill_paypal_unified_guest_form(page, identity: dict, *, log: Callable[[str]
         ("billingLine1", line1),
         ("billingLine2", line2),
         ("password", password),
-        ("dateOfBirth", str(identity.get("date_of_birth") or "")),
+        ("dateOfBirth", _normalize_paypal_dob_value(str(identity.get("date_of_birth") or ""))),
     ] + name_pairs
     check_value_script = """
     (id) => {
@@ -5687,7 +5856,8 @@ def _fill_ctf_payment_form(page, identity: dict, *, log: Callable[[str], None] |
         # 的输入掩码即便 JP 区也走美式 M/D/YYYY 布局）
         _fill_checkout_field(
             page,
-            str(identity.get("date_of_birth") or ""),
+            _normalize_paypal_dob_value(str(identity.get("date_of_birth") or ""))
+            or str(identity.get("date_of_birth") or ""),
             selectors=(
                 '#dateOfBirth',
                 'input[name="dateOfBirth"]',
@@ -7052,6 +7222,23 @@ def _open_unique_camoufox_page(
     raise RuntimeError(f"Camoufox 连续生成重复指纹: {last_hash[:12]}")
 
 
+def _is_transient_page_navigation_error(exc: BaseException) -> bool:
+    """判断 Playwright page.goto 抛错是否属于可重试的瞬时网络断连。"""
+    msg = str(exc or "").lower()
+    return any(
+        token in msg
+        for token in (
+            "err_socks_connection_failed",
+            "err_timed_out",
+            "err_connection_reset",
+            "err_connection_closed",
+            "err_proxy_connection_failed",
+            "err_tunnel_connection_failed",
+            "err_empty_response",
+        )
+    )
+
+
 def complete_paypal_checkout(
     *,
     checkout_url: str,
@@ -7206,7 +7393,25 @@ def complete_paypal_checkout(
                         page.context.add_cookies(_parse_cookie_str(cookies_str, "chatgpt.com"))
                         log("ChatGPT cookies 已注入 Camoufox")
                 log("打开 ChatGPT 测试支付链接")
-                page.goto(checkout_url, wait_until="domcontentloaded", timeout=browser_timeout)
+                last_nav_exc: Exception | None = None
+                for nav_attempt in range(1, 4):
+                    try:
+                        page.goto(checkout_url, wait_until="domcontentloaded", timeout=browser_timeout)
+                        last_nav_exc = None
+                        break
+                    except Exception as exc:  # noqa: BLE001 - 按错误内容判定是否重试
+                        last_nav_exc = exc
+                        if nav_attempt >= 3 or not _is_transient_page_navigation_error(exc):
+                            raise
+                        backoff = 1.5 * nav_attempt
+                        log(
+                            f"打开 ChatGPT 测试支付链接瞬时网络失败（第 {nav_attempt}/3 次，"
+                            f"{backoff}s 后重试）: {exc}"
+                        )
+                        time.sleep(backoff)
+                        _raise_if_cancelled()
+                if last_nav_exc is not None:
+                    raise last_nav_exc
                 _raise_if_cancelled()
                 _wait_checkout_page_ready(page, timeout_ms=browser_timeout, log=log)
                 _raise_if_cancelled()
